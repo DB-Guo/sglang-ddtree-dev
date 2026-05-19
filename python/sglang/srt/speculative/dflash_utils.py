@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.utils import is_cuda, is_musa
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
@@ -715,3 +716,21 @@ def build_ddtree_tree(
     parents = parents_np[:current_length].tolist()
 
     return node_token_ids, node_depths, parents, child_maps, visibility
+
+
+def validate_dflash_request(req: Req) -> Optional[str]:
+    if req.return_logprob:
+        return "DFLASH speculative decoding does not support return_logprob yet."
+
+    if (
+        req.sampling_params.json_schema is not None
+        or req.sampling_params.regex is not None
+        or req.sampling_params.ebnf is not None
+        or req.sampling_params.structural_tag is not None
+    ):
+        return (
+            "DFLASH speculative decoding does not support "
+            "grammar-constrained decoding yet."
+        )
+
+    return None

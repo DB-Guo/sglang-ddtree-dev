@@ -252,10 +252,13 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
         accepted token logits.
         """
         if batch.forward_mode.is_idle():
+            # hidden_size=None: worker fixup in forward_draft_extend_after_decode
+            # rebuilds via EagleDraftExtendInput.hidden_size_for(worker)
+            # (single source incl. EAGLE-3 aux widening).
             draft_extend_input = EagleDraftExtendInput.create_idle_input(
                 device=batch.device,
-                hidden_size=batch.model_config.spec_hidden_size,
-                dtype=batch.model_config.dtype,
+                hidden_size=None,
+                dtype=None,
                 capture_hidden_mode=CaptureHiddenMode.LAST,
             )
             return EagleVerifyOutput.create_idle(
@@ -435,7 +438,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 req.output_ids.append(id)
                 if req.require_reasoning and think_end_id is not None:
                     req.update_reasoning_tokens(id, think_end_id)
-                req.check_finished()
+                req.update_finish_state()
                 if not req.finished() and req.grammar is not None:
                     try:
                         req.grammar.accept_token(id)
@@ -444,7 +447,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                             f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predict=}\n"
                         )
                         raise e
-                    req.check_finished()
+                    req.update_finish_state()
                 if req.finished():
                     has_finished = True
                     # set all tokens after finished token to -1 and break
@@ -645,10 +648,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                     req_pool_indices=batch.req_pool_indices[unfinished_index_device],
                 )
             else:
+                # hidden_size=None: worker fixup rebuilds via
+                # EagleDraftExtendInput.hidden_size_for(worker) (single source).
                 draft_extend_input = EagleDraftExtendInput.create_idle_input(
                     device=batch.device,
-                    hidden_size=batch.model_config.spec_hidden_size,
-                    dtype=batch.model_config.dtype,
+                    hidden_size=None,
+                    dtype=None,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
 
@@ -1007,6 +1012,10 @@ class EagleVerifyOutput:
     num_correct_drafts_per_req_cpu: List[int]
     # Accepted indices from logits_output.next_token_logits
     accept_indices: torch.Tensor
+    # Whether the target verify forward ran a captured cuda graph. Set by
+    # the worker after `EagleVerifyInput.sample` returns; default kept so
+    # idle / direct constructions don't have to pass it.
+    can_run_cuda_graph: bool = False
 
     @classmethod
     def create_idle(

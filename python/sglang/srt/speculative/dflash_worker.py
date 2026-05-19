@@ -26,6 +26,7 @@ from sglang.srt.speculative.dflash_utils import (
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
     resolve_dflash_verify_mask_policy,
+    build_ddtree_tree,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
@@ -161,10 +162,15 @@ class DFlashWorker:
         draft_config = parse_dflash_draft_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config
         )
+
+        # TODO(DB-guo): maybe read from draft_config
+        self.enable_ddtree = server_args.speculative_dflash_enable_ddtree
         if server_args.speculative_num_draft_tokens is None:
             # Should not happen (ServerArgs should have inferred it), but keep a fallback.
             self.block_size = int(draft_config.resolve_block_size(default=16))
+            self.num_draft_tokens = self.block_size
         else:
+            self.num_draft_tokens = server_args.speculative_num_draft_tokens
             self.block_size = int(server_args.speculative_num_draft_tokens)
             model_block_size = draft_config.block_size
             if model_block_size is None:
@@ -177,6 +183,9 @@ class DFlashWorker:
                     self.block_size,
                     model_block_size,
                 )
+        # TODO(DB-guo): change this logic
+        # if self.enable_ddtree:
+        #     self.block_size = server_args.speculative_dflash_block_size
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
@@ -668,28 +677,43 @@ class DFlashWorker:
         if draft_hidden is None:
             raise RuntimeError("DFLASH draft model returned no hidden states.")
         draft_hidden = draft_hidden.view(bs, self.block_size, -1)
-        draft_next = self._greedy_sample_from_vocab_parallel_head(
-            hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
-            lm_head=lm_head,
-        ).view(bs, self.block_size - 1)
-        draft_tokens = self._draft_block_tokens_buf[:bs]
-        draft_tokens[:, 0].copy_(block_ids[:, 0])
-        draft_tokens[:, 1:].copy_(draft_next)
-        positions = positions_2d.reshape(-1)
+        if self.enable_ddtree:
+            verify_input = self._ddtree_sample_and_generate_mask(
+                draft_hidden=draft_hidden,
+                start_positions=batch.seq_lens_cpu,
+                block_ids=block_ids,
+                lm_head=lm_head,
+            )
+            verify_input.prepare_for_verify(
+                batch,
+                self.page_size,
+            )
+        else:
+            draft_next = self._greedy_sample_from_vocab_parallel_head(
+                hidden_states=draft_hidden[:, 1:, :].reshape(-1, draft_hidden.shape[-1]),
+                lm_head=lm_head,
+            ).view(bs, self.block_size - 1)
+            positions = positions_2d.reshape(-1)
 
-        verify_input = DFlashVerifyInput(
-            draft_token=draft_tokens.reshape(-1),
-            positions=positions,
-            draft_token_num=self.block_size,
-        )
-        _, build_custom_mask = resolve_dflash_verify_mask_policy(
-            self.model_runner.attn_backend
-        )
-        verify_input.prepare_for_verify(
-            batch,
-            self.page_size,
-            build_custom_mask=build_custom_mask,
-        )
+            draft_tokens = self._draft_block_tokens_buf[:bs]
+            draft_tokens[:, 0].copy_(block_ids[:, 0])
+            draft_tokens[:, 1:].copy_(draft_next)
+            verify_input = DFlashVerifyInput(
+                draft_token=draft_tokens.reshape(-1),
+                positions=positions,
+                draft_token_num=self.block_size,
+            )
+            _, need_build_causal_mask = resolve_dflash_verify_mask_policy(
+                self.model_runner.attn_backend
+            )
+            verify_input.prepare_for_verify(
+                batch,
+                self.page_size,
+            )
+            if need_build_causal_mask:
+                verify_input.build_causal_mask(batch=batch)
+            else:
+                verify_input.custom_mask = None
 
         batch.forward_mode = (
             ForwardMode.TARGET_VERIFY
@@ -872,6 +896,71 @@ class DFlashWorker:
             out_tokens[start:end].copy_(selected_ids.view(-1))
 
         return out_tokens
+
+    def _ddtree_sample_and_generate_mask(
+        self,
+        *,
+        draft_hidden: torch.Tensor,
+        start_positions: torch.Tensor,
+        block_ids,
+        lm_head,
+        chunk_size: int = 256,
+    ):
+        batch_size = draft_hidden.shape[0]
+        hidden_states = draft_hidden[:, 1:, :]
+        if hidden_states.numel() == 0:
+            return torch.empty((0,), dtype=torch.long, device=hidden_states.device)
+
+        tp_group = get_tp_group()
+        tp_size = int(tp_group.world_size)
+
+        if not hasattr(lm_head, "weight") or not hasattr(lm_head, "shard_indices"):
+            raise RuntimeError(
+                "DFLASH greedy sampling requires a vocab-parallel head with `weight` and `shard_indices`."
+            )
+
+        shard = lm_head.shard_indices
+        weight = lm_head.weight  # [local_vocab_padded, hidden]
+        num_org = int(shard.num_org_elements)
+        weight_dtype = weight.dtype
+
+        # Valid ranges in the local shard (excluding padding):
+        #   base vocab:  [0, num_org)
+        #   added vocab: [num_org_padded, num_org_padded + num_added)
+        num_added = int(shard.num_added_elements)
+    
+        if tp_size == 1 and num_added == 0:
+            logits = torch.matmul(hidden_states, weight[:num_org].T)
+            draft_tokens = self._draft_block_tokens_buf[:batch_size]
+            verify_position_ids = self._draft_block_positions_buf[:batch_size]
+            n_token = self.num_draft_tokens
+            mask_chunks: list[torch.Tensor] = []
+            for req_i in range(batch_size):
+                node_token_ids, node_depths, _, _, visibility_cpu = build_ddtree_tree(logits[req_i], self.num_draft_tokens - 1)
+                # draft token id
+                draft_tokens[req_i, 0].copy_(block_ids[req_i, 0])
+                draft_tokens[req_i, 1:].copy_(node_token_ids)
+                # positons
+                start = start_positions[req_i]
+                verify_position_ids[req_i, 0] = 0
+                verify_position_ids[req_i, 1:n_token].copy_(node_depths, non_blocking=False)
+                verify_position_ids[req_i, :].add_(start)
+                # masks
+                mask = torch.ones((n_token, n_token + start), dtype=torch.bool, device=draft_tokens.device)
+                mask[:, start:].copy_(visibility_cpu)
+                mask_chunks.append(mask.flatten())
+                
+            verify_input = DFlashVerifyInput(
+                draft_token=draft_tokens.reshape(-1),
+                positions=verify_position_ids.reshape(-1),
+                draft_token_num=n_token,
+                custom_mask=torch.cat(mask_chunks, dim=0),
+            )
+            return verify_input
+
+        else:
+            raise NotImplementedError("Currently DDTree only support tp_size == 1")        
+
 
     def _append_target_hidden_to_draft_kv(
         self,

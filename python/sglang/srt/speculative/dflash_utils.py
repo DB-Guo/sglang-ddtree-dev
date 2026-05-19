@@ -97,7 +97,8 @@ def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
             break
         backend = full_backend
     backend_name = type(backend).__name__
-    return backend_name, (backend_name not in _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS)
+    return backend_name, True
+    # return backend_name, (backend_name not in _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS)
 
 
 def _get_or_create_chain_verify_buffers(
@@ -120,6 +121,7 @@ def _get_or_create_chain_verify_buffers(
             1, draft_token_num + 1, dtype=torch.int64, device=device
         )
         row_next[-1] = -1
+        # TODO: change this input
         retrieve_next_token = row_next.unsqueeze(0).expand(new_cap, -1).clone()
         retrieve_next_sibling = torch.full(
             (new_cap, draft_token_num), -1, dtype=torch.int64, device=device
@@ -636,3 +638,80 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
     bonus = predicts[accept_pos].to(torch.int64)
     return correct_len, bonus
+
+
+def build_ddtree_tree(
+    draft_logits: torch.Tensor,
+    budget: int,
+) -> tuple[torch.Tensor, torch.Tensor, list[int], list[dict[int, int]], torch.Tensor, dict[str, float]]:
+    import numpy as np
+    import heapq
+    if budget <= 0 or draft_logits.shape[0] == 0:
+        visibility = torch.zeros((1, 1), dtype=torch.bool)
+        visibility[0, 0] = True
+        return (
+            torch.empty(0, dtype=torch.long),
+            torch.empty(0, dtype=torch.long),
+            [-1],
+            [dict()],
+            visibility,
+        )
+
+    topk = min(budget, draft_logits.shape[-1])
+    depth_limit = int(draft_logits.shape[0])
+
+    logits = draft_logits.float()
+    top_logits, top_token_ids = torch.topk(logits, k=topk, dim=-1)
+    log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
+    top_log_probs_cpu = (top_logits - log_z).to(device="cpu", dtype=torch.float32)
+    top_token_ids_cpu = top_token_ids.to(device="cpu", dtype=torch.long)
+
+    top_log_probs_np = top_log_probs_cpu.numpy()
+    top_token_ids_np = top_token_ids_cpu.numpy()
+
+    first_logw = float(top_log_probs_np[0, 0])
+    heap: list[tuple[float, tuple[int, ...], int, int, int, float]] = [(-first_logw, (0,), 0, 1, 0, first_logw)]
+
+    node_token_ids_np = np.empty(budget, dtype=np.int64)
+    node_depths_np = np.empty(budget, dtype=np.int64)
+    parents_np = np.empty(budget + 1, dtype=np.int32)
+    parents_np[0] = -1
+    child_maps: list[dict[int, int]] = [dict()]
+    node_count = 0
+
+    while heap and node_count < budget:
+        _, ranks, parent_index, depth, rank, logw = heapq.heappop(heap)
+
+        token_id = int(top_token_ids_np[depth - 1, rank])
+        current_index = node_count + 1
+        node_token_ids_np[node_count] = token_id
+        node_depths_np[node_count] = depth
+        parents_np[current_index] = parent_index
+        child_maps.append(dict())
+        child_maps[parent_index][token_id] = current_index
+        node_count += 1
+
+        if rank + 1 < topk:
+            sibling_ranks = ranks[:-1] + (rank + 1,)
+            sibling_logw = logw - float(top_log_probs_np[depth - 1, rank]) + float(top_log_probs_np[depth - 1, rank + 1])
+            heapq.heappush(heap, (-sibling_logw, sibling_ranks, parent_index, depth, rank + 1, sibling_logw))
+
+        if depth < depth_limit:
+            child_ranks = ranks + (0,)
+            child_logw = logw + float(top_log_probs_np[depth, 0])
+            heapq.heappush(heap, (-child_logw, child_ranks, current_index, depth + 1, 0, child_logw))
+
+    current_length = 1 + node_count
+    visibility_np = np.zeros((current_length, current_length), dtype=np.bool_)
+    visibility_np[0, 0] = True
+    for index in range(1, current_length):
+        parent_index = int(parents_np[index])
+        visibility_np[index, :index] = visibility_np[parent_index, :index]
+        visibility_np[index, index] = True
+
+    node_token_ids = torch.from_numpy(node_token_ids_np[:node_count])
+    node_depths = torch.from_numpy(node_depths_np[:node_count])
+    visibility = torch.from_numpy(visibility_np)
+    parents = parents_np[:current_length].tolist()
+
+    return node_token_ids, node_depths, parents, child_maps, visibility

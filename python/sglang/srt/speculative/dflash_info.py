@@ -181,8 +181,6 @@ class DFlashVerifyInput(SpecInput):
         self,
         batch: ScheduleBatch,
         page_size: int,
-        *,
-        build_custom_mask: bool = True,
     ):
         if batch.forward_mode.is_idle():
             return
@@ -224,10 +222,10 @@ class DFlashVerifyInput(SpecInput):
             bs,
         )
 
-        if not build_custom_mask:
-            self.custom_mask = None
-            return
-
+    def build_causal_mask(
+        self,
+        batch: ScheduleBatch
+    ):
         if self.draft_token_num <= 0:
             raise ValueError(
                 f"DFLASH draft_token_num must be positive, got {self.draft_token_num}."

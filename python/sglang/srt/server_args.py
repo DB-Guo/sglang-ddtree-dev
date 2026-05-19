@@ -574,7 +574,6 @@ class ServerArgs:
     speculative_num_steps: Optional[int] = None
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
-    speculative_dflash_block_size: Optional[int] = None
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -598,6 +597,12 @@ class ServerArgs:
     speculative_ngram_external_sam_budget: int = 0
     speculative_ngram_external_corpus_max_tokens: int = 10000000
     enable_multi_layer_eagle: bool = False
+
+    # Speculative decoding (dflash)
+    speculative_dflash_block_size: Optional[int] = None
+    speculative_dflash_enable_ddtree: bool = False
+    # TODO(DB-guo): maybe just use (speculative_num_draft_tokens - 1)
+    speculative_ddtree_num_tree_nodes: Optional[int] = None
 
     # Expert parallelism
     ep_size: int = 1
@@ -3544,18 +3549,20 @@ class ServerArgs:
                         "DFLASH requires --speculative-dflash-block-size to be positive, "
                         f"got {self.speculative_dflash_block_size}."
                     )
-                if self.speculative_num_draft_tokens is not None and int(
-                    self.speculative_num_draft_tokens
-                ) != int(self.speculative_dflash_block_size):
-                    raise ValueError(
-                        "Both --speculative-num-draft-tokens and --speculative-dflash-block-size are set "
-                        "but they differ. For DFLASH they must match. "
-                        f"speculative_num_draft_tokens={self.speculative_num_draft_tokens}, "
-                        f"speculative_dflash_block_size={self.speculative_dflash_block_size}."
+                # For DDTree, block_size may not match num_draft_tokens
+                if not self.speculative_dflash_enable_ddtree:
+                    if self.speculative_num_draft_tokens is not None and int(
+                        self.speculative_num_draft_tokens
+                    ) != int(self.speculative_dflash_block_size):
+                        raise ValueError(
+                            "Both --speculative-num-draft-tokens and --speculative-dflash-block-size are set "
+                            "but they differ. For DFLASH they must match. "
+                            f"speculative_num_draft_tokens={self.speculative_num_draft_tokens}, "
+                            f"speculative_dflash_block_size={self.speculative_dflash_block_size}."
+                        )
+                    self.speculative_num_draft_tokens = int(
+                        self.speculative_dflash_block_size
                     )
-                self.speculative_num_draft_tokens = int(
-                    self.speculative_dflash_block_size
-                )
 
             window_size = None
             if self.speculative_draft_window_size is not None:
@@ -5704,6 +5711,12 @@ class ServerArgs:
             type=int,
             help="DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
             default=ServerArgs.speculative_dflash_block_size,
+        )
+        parser.add_argument(
+            "--speculative-dflash-enable-ddtree",
+            action="store_true",
+            help="DFLASH only. Enable ddtree sample for dflash.",
+            default=ServerArgs.speculative_dflash_enable_ddtree,
         )
         parser.add_argument(
             "--speculative-accept-threshold-single",

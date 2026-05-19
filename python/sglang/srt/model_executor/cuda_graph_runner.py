@@ -1418,6 +1418,9 @@ class CudaGraphRunner:
             _, build_custom_mask = resolve_dflash_verify_mask_policy(
                 self.model_runner.attn_backend
             )
+            # DDTree use tree attention, need custom mask
+            if self.model_runner.server_args.speculative_dflash_enable_ddtree:
+                build_custom_mask = True
             spec_info = DFlashVerifyInput(
                 draft_token=None,
                 positions=None,

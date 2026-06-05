@@ -156,18 +156,20 @@ def _handle_dflash(server_args: "ServerArgs") -> None:
                 "DFLASH requires --speculative-dflash-block-size to be positive, "
                 f"got {server_args.speculative_dflash_block_size}."
             )
-        if server_args.speculative_num_draft_tokens is not None and int(
-            server_args.speculative_num_draft_tokens
-        ) != int(server_args.speculative_dflash_block_size):
-            raise ValueError(
-                "Both --speculative-num-draft-tokens and --speculative-dflash-block-size are set "
-                "but they differ. For DFLASH they must match. "
-                f"speculative_num_draft_tokens={server_args.speculative_num_draft_tokens}, "
-                f"speculative_dflash_block_size={server_args.speculative_dflash_block_size}."
+        # For DDTree, block_size may not match num_draft_tokens
+        if not server_args.speculative_dflash_enable_ddtree:
+            if server_args.speculative_num_draft_tokens is not None and int(
+                server_args.speculative_num_draft_tokens
+            ) != int(server_args.speculative_dflash_block_size):
+                raise ValueError(
+                    "Both --speculative-num-draft-tokens and --speculative-dflash-block-size are set "
+                    "but they differ. For DFLASH they must match. "
+                    f"speculative_num_draft_tokens={server_args.speculative_num_draft_tokens}, "
+                    f"speculative_dflash_block_size={server_args.speculative_dflash_block_size}."
+                )
+            server_args.speculative_num_draft_tokens = int(
+                server_args.speculative_dflash_block_size
             )
-        server_args.speculative_num_draft_tokens = int(
-            server_args.speculative_dflash_block_size
-        )
 
     if server_args.speculative_num_draft_tokens is None:
         from sglang.srt.speculative.dflash_utils import (

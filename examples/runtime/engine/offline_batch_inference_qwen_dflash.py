@@ -7,15 +7,17 @@ from urllib.request import urlopen
 
 import sglang as sgl
 import torch
+import random
+import numpy as np
 
 # Processing the prompt.
 def process_requests(llm: sgl.Engine, prompts: list[str]) -> None:
     # Create a sampling params object.
     sampling_params = {
-        "temperature": 0.7,
+        "temperature": 0.0,
         "top_p": 0.8,
         "top_k": 20,
-        "repetition_penalty": 1.05,
+        # "repetition_penalty": 1.05,
         "max_new_tokens": 256,
     }
     # Generate texts from the prompts.
@@ -31,63 +33,91 @@ def process_requests(llm: sgl.Engine, prompts: list[str]) -> None:
 
 # Create an LLM.85St32oa!7_Z:1Rp
 def initialize_engine() -> sgl.Engine:
-    llm = sgl.Engine(
-        model_path="Qwen/Qwen3-4B",
-        speculative_algorithm="DFLASH",
-        speculative_draft_model_path="z-lab/Qwen3-4B-DFlash-b16",
-        # speculative_dflash_enable_ddtree=True,
-        # mamba_scheduler_strategy="extra_buffer",
-        speculative_num_draft_tokens=16,
-        tp_size=1,
-        max_running_requests=5,
-        # context_length=1048576,
-        # page_size=256,
-        # attention_backend="dual_chunk_flash_attn",
-        # tp_size=4,
-        # disable_radix_cache=True,
-        # enable_mixed_chunk=False,
-        # enable_torch_compile=False,
-        # chunked_prefill_size=131072,
-        mem_fraction_static=0.9,
-        max_total_tokens=1024,
-        # piecewise_cuda_graph_compiler="eager",
-        log_level="debug",
-        # speculative_dflash_enable_ddtree=True,
-        # disable_cuda_graph=True,
-        # disable_piecewise_cuda_graph=True,
-    )
-    # llm = sgl.Engine(
-    #     model_path="Qwen/Qwen3-0.6B",
-    #     # speculative_algorithm="NGRAM",
-    #     # speculative_num_draft_tokens=4,
-    #     # context_length=1048576,
-    #     # page_size=256,
-    #     # attention_backend="dual_chunk_flash_attn",
-    #     # tp_size=4,
-    #     # disable_radix_cache=True,
-    #     enable_mixed_chunk=False,
-    #     enable_torch_compile=False,
-    #     # chunked_prefill_size=131072,
-    #     mem_fraction_static=0.6,
-    #     log_level="DEBUG",
-    #     piecewise_cuda_graph_compiler="eager",
-    #     trust_remote_code=True,
-    #     # disable_cuda_graph=True,
-    #     # disable_piecewise_cuda_graph=True,
-    # )
+    ddtree = False
+    ddtree = True
+    if ddtree:
+        llm = sgl.Engine(
+            model_path="Qwen/Qwen3-4B",
+            speculative_algorithm="DFLASH",
+            speculative_draft_model_path="z-lab/Qwen3-4B-DFlash-b16",
+            # speculative_dflash_enable_ddtree=True,
+            # mamba_scheduler_strategy="extra_buffer",
+            speculative_num_draft_tokens=16,
+            tp_size=1,
+            max_running_requests=5,
+            # page_size=16,
+            # context_length=1048576,
+            # page_size=256,
+            # attention_backend="dual_chunk_flash_attn",
+            # tp_size=4,
+            # disable_radix_cache=True,
+            # enable_mixed_chunk=False,
+            # enable_torch_compile=False,
+            # chunked_prefill_size=131072,
+            mem_fraction_static=0.9,
+            max_total_tokens=1024,
+            # piecewise_cuda_graph_compiler="eager",
+            # log_level="debug",
+            # speculative_dflash_enable_ddtree=True,
+            disable_cuda_graph=True,
+            disable_piecewise_cuda_graph=True,
+        )
+    else:
+        llm = sgl.Engine(
+            model_path="Qwen/Qwen3-4B",
+            speculative_algorithm="EAGLE",
+            speculative_draft_model_path="AngelSlim/Qwen3-4B_eagle3",
+            # speculative_dflash_enable_ddtree=True,
+            # mamba_scheduler_strategy="extra_buffer",
+            speculative_num_draft_tokens=16,
+            speculative_num_steps=3,
+            speculative_eagle_topk=5,
+            tp_size=1,
+            max_running_requests=5,
+            # context_length=1048576,
+            page_size=16,
+            # attention_backend="dual_chunk_flash_attn",
+            # tp_size=4,
+            # disable_radix_cache=True,
+            # enable_mixed_chunk=False,
+            # enable_torch_compile=False,
+            # chunked_prefill_size=131072,
+            mem_fraction_static=0.9,
+            max_total_tokens=1024,
+            # piecewise_cuda_graph_compiler="eager",
+            log_level="debug",
+            # speculative_dflash_enable_ddtree=True,
+            disable_cuda_graph=True,
+            disable_piecewise_cuda_graph=True,
+        )
     return llm
 
 
 def main():
     llm = initialize_engine()
-    # prompt = load_prompt()
-    prompt = "Hello, please introduce yourself"
-    prompts = [prompt]
-    prompts.append("Which part of computer science do you like best")
+    prompts = [
+        "Hello, please introduce yourself",
+        "Which part of computer science do you like best",
+    ]
 
     process_requests(llm, prompts)
 
 
 if __name__ == "__main__":
     torch.set_printoptions(linewidth=500)
+    SEED = 42
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    torch.cuda.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+    # 禁用 CUDA 非确定性算法
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    # 禁用 torch 动态算子非确定性
+    torch.use_deterministic_algorithms(True)
+    # 环境变量锁定 CUDA 运算顺序
+    import os
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    os.environ["PYTHONHASHSEED"] = str(SEED)
     main()

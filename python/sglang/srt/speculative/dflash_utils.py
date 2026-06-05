@@ -679,6 +679,8 @@ def build_ddtree_tree(
     parents_np[0] = -1
     child_maps: list[dict[int, int]] = [dict()]
     node_count = 0
+    retrieve_next_token_cpu = torch.full((budget + 1,), -1, device="cpu", dtype=torch.long)
+    retrieve_next_sibling_cpu = torch.full((budget + 1,), -1, device="cpu", dtype=torch.long)
 
     while heap and node_count < budget:
         _, ranks, parent_index, depth, rank, logw = heapq.heappop(heap)
@@ -688,6 +690,12 @@ def build_ddtree_tree(
         node_token_ids_np[node_count] = token_id
         node_depths_np[node_count] = depth
         parents_np[current_index] = parent_index
+        if retrieve_next_token_cpu[parent_index] == -1:
+            retrieve_next_token_cpu[parent_index] = current_index
+        else:
+            org_next_token = int(retrieve_next_token_cpu[parent_index])
+            retrieve_next_token_cpu[parent_index] = current_index
+            retrieve_next_sibling_cpu[current_index] = org_next_token
         child_maps.append(dict())
         child_maps[parent_index][token_id] = current_index
         node_count += 1
@@ -715,7 +723,7 @@ def build_ddtree_tree(
     visibility = torch.from_numpy(visibility_np)
     parents = parents_np[:current_length].tolist()
 
-    return node_token_ids, node_depths, parents, child_maps, visibility
+    return node_token_ids, node_depths, parents, child_maps, visibility, retrieve_next_token_cpu, retrieve_next_sibling_cpu
 
 
 def validate_dflash_request(req: Req) -> Optional[str]:

@@ -21,8 +21,26 @@ from sglang.srt.speculative.dflash_utils import (
     is_dflash_sampling_verify_available,
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
-from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
+from sglang.srt.speculative.spec_utils import (
+    assign_req_to_token_pool_func,
+    get_src_tgt_cache_loc,
+    get_target_cache_loc,
+)
 
+import torch.nn.functional as F
+from sgl_kernel import (
+    top_k_renorm_prob,
+    top_p_renorm_prob,
+    tree_speculative_sampling_target_only,
+)
+from sglang.srt.server_args import get_global_server_args
+
+from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
+from sglang.srt.utils import next_power_of_2
+
+
+import logging
+logger = logging.getLogger(__name__)
 
 def _compute_paged_keep_slots(
     *,
@@ -169,6 +187,11 @@ class DFlashVerifyInput(SpecInput):
     # Shape info for padding (e.g., DP attention / CUDA graph).
     num_tokens_per_batch: int = -1
 
+    # for DDTree verify
+    retrieve_index: torch.Tensor = None
+    retrieve_next_token: torch.Tensor = None
+    retrieve_next_sibling: torch.Tensor = None
+
     def __post_init__(self):
         super().__init__(spec_input_type=SpecInputType.DFLASH_VERIFY)
         if self.num_tokens_per_batch == -1:
@@ -308,6 +331,312 @@ class DFlashVerifyInput(SpecInput):
                 self.custom_mask = mask
         return kv_indices, cum_kv_seq_len, qo_indptr, mask
 
+    def tree_verify(
+        self,
+        *,
+        batch: ScheduleBatch,
+        logits_output: LogitsProcessorOutput,
+        page_size: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, List[int]]:
+        if batch.forward_mode.is_idle():
+            empty = torch.empty((0,), dtype=torch.int64, device=batch.device)
+            return empty, empty.to(torch.int32), empty, []
+
+        bs = batch.batch_size()
+        device = logits_output.next_token_logits.device
+
+        sampling_info = batch.sampling_info
+        if sampling_info is not None:
+            if len(sampling_info) != bs:
+                raise RuntimeError(
+                    "DFLASH verify sampling_info size mismatch: "
+                    f"len(sampling_info)={len(sampling_info)}, bs={bs}."
+                )
+
+            # Keep speculative verify semantics consistent with normal sampling path.
+            if sampling_info.has_custom_logit_processor:
+                apply_custom_logit_processor(
+                    logits_output.next_token_logits,
+                    sampling_info,
+                    num_tokens_in_batch=self.draft_token_num,
+                )
+
+            if (
+                sampling_info.penalizer_orchestrator.is_required
+                or sampling_info.logit_bias is not None
+            ):
+                linear_penalty = torch.zeros(
+                    (bs, logits_output.next_token_logits.shape[1]),
+                    dtype=torch.float32,
+                    device=device,
+                )
+                sampling_info.apply_logits_bias(linear_penalty)
+                logits_output.next_token_logits.add_(
+                    torch.repeat_interleave(linear_penalty, self.draft_token_num, dim=0)
+                )
+
+        candidates = self.draft_token.view(bs, self.draft_token_num)
+        predicts = torch.empty(bs * self.draft_token_num, dtype=torch.int32, device=batch.device)
+        accept_index = torch.full(
+            (bs, self.draft_token_num), -1, dtype=torch.int32, device=batch.device
+        )
+        accept_token_num = torch.empty((bs,), dtype=torch.int32, device=batch.device)
+        if (
+            sampling_info is not None
+            and not sampling_info.is_all_greedy
+            and is_dflash_sampling_verify_available()
+        ):
+            # TODO: just reuse this part in dflash_utils
+            # ref: compute_dflash_sampling_correct_drafts_and_bonus
+            assert candidates.ndim == 2
+            next_token_logits = logits_output.next_token_logits
+            assert next_token_logits.ndim == 2
+            bs, draft_token_num = candidates.shape
+            assert bs > 0
+            assert draft_token_num > 0
+            assert next_token_logits.shape[0] == bs * draft_token_num
+            assert candidates.device == next_token_logits.device
+            threshold_single = get_global_server_args().speculative_accept_threshold_single
+            threshold_acc = get_global_server_args().speculative_accept_threshold_acc
+            threshold_single = float(threshold_single)
+            threshold_acc = max(float(threshold_acc), 1e-9)
+            device = next_token_logits.device
+            uniform_samples = torch.rand(
+                (bs, draft_token_num), dtype=torch.float32, device=device
+            )
+            uniform_samples_for_final_sampling = torch.rand(
+                (bs,), dtype=torch.float32, device=device
+            )
+            need_top_k = bool(getattr(sampling_info, "need_top_k_sampling", True))
+            need_top_p = bool(getattr(sampling_info, "need_top_p_sampling", False))
+            # Build target distribution once over all verify rows.
+            expanded_temperature = torch.repeat_interleave(
+                sampling_info.temperatures, draft_token_num, dim=0
+            )
+            scaled_logits = next_token_logits / expanded_temperature
+            sparse_topk_applied = False
+            use_sparse_topk = True
+            if use_sparse_topk and need_top_k:
+                repeated_top_ks = torch.repeat_interleave(
+                    sampling_info.top_ks, draft_token_num, dim=0
+                ).to(dtype=torch.int64)
+                vocab_size = int(scaled_logits.shape[-1])
+                repeated_top_ks.clamp_(min=1, max=vocab_size)
+                max_top_k = int(repeated_top_ks.max().item())
+
+                # Sparse exact path for top-k/top-p (top-k-first semantics), then scatter to dense.
+                if 0 < max_top_k < vocab_size:
+                    topk_logits, topk_indices = torch.topk(scaled_logits, k=max_top_k, dim=-1)
+                    if not torch.all(repeated_top_ks == max_top_k):
+                        ranks = torch.arange(max_top_k, device=device, dtype=torch.int64)[
+                            None, :
+                        ]
+                        valid = ranks < repeated_top_ks.unsqueeze(1)
+                        topk_logits = topk_logits.masked_fill(~valid, float("-inf"))
+
+                    topk_probs = F.softmax(topk_logits, dim=-1)
+                    if need_top_p:
+                        repeated_top_ps = torch.repeat_interleave(
+                            sampling_info.top_ps, draft_token_num, dim=0
+                        )
+                        topk_probs = top_p_renorm_prob(topk_probs, repeated_top_ps)
+
+                    target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
+                    target_probs.scatter_(1, topk_indices, topk_probs)
+                    sparse_topk_applied = True
+
+            if not sparse_topk_applied:
+                target_probs = F.softmax(scaled_logits, dim=-1)
+                if need_top_k:
+                    target_probs = top_k_renorm_prob(
+                        target_probs,
+                        torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
+                    )
+                if need_top_p:
+                    target_probs = top_p_renorm_prob(
+                        target_probs,
+                        torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
+                    )
+            target_probs = target_probs.view(bs, draft_token_num, -1).contiguous()
+            draft_probs = torch.zeros_like(target_probs)
+            candidates_i64 = (
+                candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)
+            )
+            
+            tree_speculative_sampling_target_only(
+                predicts=predicts,
+                accept_index=accept_index,
+                accept_token_num=accept_token_num,
+                candidates=candidates_i64,
+                retrive_index=self.retrieve_index,
+                retrive_next_token=self.retrieve_next_token,
+                retrive_next_sibling=self.retrieve_next_sibling,
+                uniform_samples=uniform_samples,
+                uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+                target_probs=target_probs,
+                draft_probs=draft_probs,
+                threshold_single=threshold_single,
+                threshold_acc=threshold_acc,
+                deterministic=True,
+            )
+            # TODO TP broadcast predict accept_index num_correct_drafts??
+
+        else:
+            target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
+                bs, self.draft_token_num
+            )
+
+            predicts, accept_index, num_correct_drafts = verify_tree_greedy_func(
+                predicts=predicts,  # mutable
+                accept_index=accept_index,  # mutable
+                accept_token_num=accept_token_num,  # mutable
+                candidates=candidates,
+                retrieve_index=self.retrieve_index,
+                retrieve_next_token=self.retrieve_next_token,
+                retrieve_next_sibling=self.retrieve_next_sibling,
+                target_predict=target_predict,
+                topk=1, # not used
+            )
+        correct_len = accept_token_num
+        row_ids = torch.arange(bs, dtype=torch.long, device=device)
+        accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
+        new_bonus_tokens = predicts[accept_pos].to(torch.int64)
+
+
+        unfinished_index = []
+        unfinished_accept_index = []
+        accept_index_cpu = accept_index.tolist()
+        predict_cpu = predicts.tolist()
+        has_finished = False
+        think_end_id = batch.model_config.think_end_id
+
+        # Iterate every accepted token and check if req has finished after append the token
+        # should be checked BEFORE free kv cache slots
+        num_correct_drafts_per_req_cpu: List[int] = []
+        commit_lens_cpu = []
+
+        for i, (req, accept_index_row) in enumerate(zip(batch.reqs, accept_index_cpu)):
+            num_accept_tokens = 0
+            for j, idx in enumerate(accept_index_row):
+                if idx == -1:
+                    break
+                num_accept_tokens += 1
+                id = predict_cpu[idx]
+                req.output_ids.append(id)
+                if req.require_reasoning and think_end_id is not None:
+                    req.update_reasoning_tokens(id, think_end_id)
+                req.update_finish_state()
+                if not req.finished() and req.grammar is not None:
+                    try:
+                        req.grammar.accept_token(id)
+                    except ValueError as e:
+
+                        logger.info(
+                            f"{i=}, {req=}\n" f"{accept_index=}\n" f"{predicts=}\n"
+                        )
+                        raise e
+                    req.update_finish_state()
+                if req.finished():
+                    has_finished = True
+                    # set all tokens after finished token to -1 and break
+                    accept_index[i, j + 1 :] = -1
+                    break
+            # Update KV cache tracking for the accepted tokens
+            req.kv_committed_len += num_accept_tokens
+            req.kv_allocated_len = req.kv_committed_len
+            commit_lens_cpu.append(num_accept_tokens)
+            num_correct_drafts_per_req_cpu.append(max(0, num_accept_tokens - 1))
+            if not req.finished():
+                unfinished_index.append(i)
+                if idx == -1:
+                    unfinished_accept_index.append(accept_index[i, :j])
+                else:
+                    unfinished_accept_index.append(accept_index[i])
+            req.spec_verify_ct += 1
+            num_correct_drafts_this_req = (
+                sum(1 for idx in accept_index_row if idx != -1) - 1
+            )
+            req.spec_num_correct_drafts += num_correct_drafts_this_req
+            req.update_spec_correct_drafts_histogram(num_correct_drafts_this_req)
+        if has_finished:
+            num_correct_drafts = (accept_index != -1).sum(dim=1) - 1
+
+        commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
+        # new_bonus_tokens = torch.tensor(
+        #     new_bonus_tokens_list, dtype=torch.int64, device=device
+        # )
+
+        # Free uncommitted KV cache slots
+        accept_index = accept_index[accept_index != -1]
+        evict_mask = torch.full_like(self.draft_token, True, dtype=torch.bool)
+        evict_mask[accept_index] = False
+        if page_size == 1:
+            batch.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+        else:
+            src_cache_loc, tgt_cache_loc, to_free_num_slots = get_src_tgt_cache_loc(
+                batch.seq_lens,
+                batch.out_cache_loc,
+                accept_index,
+                num_correct_drafts,
+                self.draft_token_num,
+                page_size,
+            )
+            to_free_slots = torch.empty(
+                (to_free_num_slots.sum().item(),),
+                dtype=torch.int64,
+                device=to_free_num_slots.device,
+            )
+            get_target_cache_loc[(bs,)](
+                tgt_cache_loc,
+                to_free_slots,
+                num_correct_drafts,
+                to_free_num_slots,
+                batch.out_cache_loc,
+                self.draft_token_num,
+                next_power_of_2(self.draft_token_num),
+                next_power_of_2(bs),
+            )
+
+            # Free the kv cache
+            batch.token_to_kv_pool_allocator.free(to_free_slots)
+
+            # Copy the kv cache
+            batch.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
+                tgt_cache_loc, src_cache_loc
+            )
+        
+        # Update req_to_token pool mapping for newly committed tokens.
+        end_offset = batch.seq_lens + commit_lens.to(batch.seq_lens.dtype)
+        assign_req_to_token_pool_func(
+            batch.req_pool_indices,
+            batch.req_to_token_pool.req_to_token,
+            batch.seq_lens,
+            end_offset,
+            batch.out_cache_loc,
+            bs,
+        )
+
+        # Update batch seq lens.
+        batch.seq_lens.add_(commit_lens.to(batch.seq_lens.dtype))
+        batch.seq_lens_cpu.add_(
+            torch.tensor(commit_lens_cpu, dtype=batch.seq_lens_cpu.dtype)
+        )
+        # Keep seq_lens_sum in sync; flashinfer indices updaters rely on this for buffer sizing.
+        batch.seq_lens_sum += sum(commit_lens_cpu)
+
+        next_target_hidden = logits_output.hidden_states[accept_index]
+
+        # Avoid confusing downstream consumers (spec-v1 decode doesn't use this).
+        logits_output.hidden_states = None
+
+        return (
+            new_bonus_tokens,
+            commit_lens,
+            next_target_hidden,
+            num_correct_drafts_per_req_cpu,
+        )
+
+
     def verify(
         self,
         *,
@@ -326,6 +655,9 @@ class DFlashVerifyInput(SpecInput):
         if batch.forward_mode.is_idle():
             empty = torch.empty((0,), dtype=torch.int64, device=batch.device)
             return empty, empty.to(torch.int32), empty, []
+
+        if self.retrieve_index is not None:
+            return self.tree_verify(batch=batch, logits_output=logits_output, page_size=page_size)
 
         bs = batch.batch_size()
         device = logits_output.next_token_logits.device

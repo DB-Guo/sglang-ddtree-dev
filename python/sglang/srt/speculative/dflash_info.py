@@ -486,7 +486,7 @@ class DFlashVerifyInput(SpecInput):
                 bs, self.draft_token_num
             )
 
-            predicts, accept_index, num_correct_drafts = verify_tree_greedy_func(
+            predicts, accept_index, accept_token_num = verify_tree_greedy_func(
                 predicts=predicts,  # mutable
                 accept_index=accept_index,  # mutable
                 accept_token_num=accept_token_num,  # mutable
@@ -501,7 +501,6 @@ class DFlashVerifyInput(SpecInput):
         row_ids = torch.arange(bs, dtype=torch.long, device=device)
         accept_pos = accept_index[row_ids, correct_len.to(torch.long)].to(torch.long)
         new_bonus_tokens = predicts[accept_pos].to(torch.int64)
-
 
         unfinished_index = []
         unfinished_accept_index = []
@@ -559,12 +558,9 @@ class DFlashVerifyInput(SpecInput):
             req.spec_num_correct_drafts += num_correct_drafts_this_req
             req.update_spec_correct_drafts_histogram(num_correct_drafts_this_req)
         if has_finished:
-            num_correct_drafts = (accept_index != -1).sum(dim=1) - 1
+            accept_token_num = (accept_index != -1).sum(dim=1) - 1
 
         commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
-        # new_bonus_tokens = torch.tensor(
-        #     new_bonus_tokens_list, dtype=torch.int64, device=device
-        # )
 
         # Free uncommitted KV cache slots
         accept_index = accept_index[accept_index != -1]
@@ -572,12 +568,13 @@ class DFlashVerifyInput(SpecInput):
         evict_mask[accept_index] = False
         if page_size == 1:
             batch.token_to_kv_pool_allocator.free(batch.out_cache_loc[evict_mask])
+            batch.out_cache_loc = batch.out_cache_loc[accept_index]
         else:
             src_cache_loc, tgt_cache_loc, to_free_num_slots = get_src_tgt_cache_loc(
                 batch.seq_lens,
                 batch.out_cache_loc,
                 accept_index,
-                num_correct_drafts,
+                accept_token_num,
                 self.draft_token_num,
                 page_size,
             )
@@ -589,7 +586,7 @@ class DFlashVerifyInput(SpecInput):
             get_target_cache_loc[(bs,)](
                 tgt_cache_loc,
                 to_free_slots,
-                num_correct_drafts,
+                accept_token_num,
                 to_free_num_slots,
                 batch.out_cache_loc,
                 self.draft_token_num,

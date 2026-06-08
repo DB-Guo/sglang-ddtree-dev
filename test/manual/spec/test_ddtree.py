@@ -42,7 +42,7 @@ class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
             "DFLASH",
             "--speculative-draft-model-path",
             cls.draft_model,
-            "--speculative-dflash-enable-ddtree"
+            "--speculative-dflash-enable-ddtree",
             "--page-size",
             str(cls.page_size),
             "--max-running-requests",

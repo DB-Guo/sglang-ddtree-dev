@@ -601,6 +601,7 @@ class DFlashVerifyInput(SpecInput):
             batch.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
                 tgt_cache_loc, src_cache_loc
             )
+            batch.out_cache_loc = tgt_cache_loc
         
         # Update req_to_token pool mapping for newly committed tokens.
         end_offset = batch.seq_lens + commit_lens.to(batch.seq_lens.dtype)

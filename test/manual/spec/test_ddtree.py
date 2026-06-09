@@ -10,8 +10,6 @@ from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.matched_stop_kit import MatchedStopMixin
 from sglang.test.kits.radix_cache_server_kit import gen_radix_tree
 from sglang.test.test_utils import (
-    DEFAULT_DRAFT_MODEL_DFLASH,
-    DEFAULT_TARGET_MODEL_DFLASH,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -21,8 +19,9 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=302, stage="base-b", runner_config="1-gpu-small")
 
 # ref: test/registered/spec/dflash/test_dflash.py
+# TODO(DB-guo): MatchedStopMixin
 class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
-    max_running_requests = 64
+    max_running_requests = 16
     attention_backend = "flashinfer"
     page_size = 1
     other_launch_args = []
@@ -43,6 +42,10 @@ class TestDFlashServerBase(CustomTestCase, MatchedStopMixin, GSM8KMixin):
             "--speculative-draft-model-path",
             cls.draft_model,
             "--speculative-dflash-enable-ddtree",
+            "--mem-fraction-static",
+            0.9,
+            "--max-total-tokens",
+            5120,
             "--page-size",
             str(cls.page_size),
             "--max-running-requests",
@@ -114,6 +117,14 @@ class TestDFlashServerPage256(TestDFlashServerBase):
         res = requests.post(self.base_url + "/generate", json=data)
         assert res.status_code == 200
         assert self.process.poll() is None
+
+# TODO(DB-guo):
+# class TestDFlashServerChunkedPrefill(TestDFlashServerBase):
+#     other_launch_args = ["--chunked-prefill-size", "4"]
+
+
+# class TestDFlashServerNoCudaGraph(TestDFlashServerBase):
+#     other_launch_args = ["--disable-cuda-graph"]
 
 if __name__ == "__main__":
     unittest.main()

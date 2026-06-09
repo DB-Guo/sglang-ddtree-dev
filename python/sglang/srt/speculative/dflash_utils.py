@@ -641,13 +641,12 @@ def compute_dflash_sampling_correct_drafts_and_bonus(
     return correct_len, bonus
 
 
-def build_ddtree_tree(
-    draft_logits: torch.Tensor,
+def build_ddtree_tree_one_req(
+    top_token_ids: torch.Tensor, # (num_draft_tokens - 1, topk)
+    top_log_probs: torch.Tensor, # (num_draft_tokens - 1, topk)
     budget: int,
 ) -> tuple[torch.Tensor, torch.Tensor, list[int], list[dict[int, int]], torch.Tensor, dict[str, float]]:
-    import numpy as np
-    import heapq
-    if budget <= 0 or draft_logits.shape[0] == 0:
+    if budget <= 0:
         visibility = torch.zeros((1, 1), dtype=torch.bool)
         visibility[0, 0] = True
         return (
@@ -657,14 +656,13 @@ def build_ddtree_tree(
             [dict()],
             visibility,
         )
+    import numpy as np
+    import heapq
 
-    topk = min(budget, draft_logits.shape[-1])
-    depth_limit = int(draft_logits.shape[0])
+    topk = min(budget, top_token_ids.shape[-1])
+    depth_limit = int(top_token_ids.shape[0])
 
-    logits = draft_logits.float()
-    top_logits, top_token_ids = torch.topk(logits, k=topk, dim=-1)
-    log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
-    top_log_probs_cpu = (top_logits - log_z).to(device="cpu", dtype=torch.float32)
+    top_log_probs_cpu = top_log_probs.to(device="cpu", dtype=torch.float32)
     top_token_ids_cpu = top_token_ids.to(device="cpu", dtype=torch.long)
 
     top_log_probs_np = top_log_probs_cpu.numpy()

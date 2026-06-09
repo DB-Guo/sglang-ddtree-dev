@@ -26,7 +26,7 @@ from sglang.srt.speculative.dflash_utils import (
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
     resolve_dflash_verify_mask_policy,
-    build_ddtree_tree,
+    build_ddtree_tree_one_req
 )
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
@@ -938,59 +938,63 @@ class DFlashWorker:
             logits = torch.matmul(hidden_states, weight[:num_org].T)
             token_budget = self.num_draft_tokens - 1
             topk = min(token_budget, logits.shape[-1])
-            # top_logits, top_token_ids = torch.topk(logits, k=topk, dim=-1)
-            # log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
-            draft_tokens = self._draft_block_tokens_buf[:batch_size]
-            verify_position_ids = self._draft_block_positions_buf[:batch_size]
-            n_token = self.num_draft_tokens
-            mask_chunks: list[torch.Tensor] = []
-            retrieve_buf = torch.full(
-                (2, batch_size, n_token), -1, device=draft_tokens.device, dtype=torch.long
-            )
-            retrieve_next_token, retrieve_next_sibling = retrieve_buf
-            retrieve_index = torch.arange(0, batch_size * n_token, device=draft_tokens.device).reshape(batch_size, n_token)
-            for req_i in range(batch_size):
-                (
-                    node_token_ids,
-                    node_depths,
-                    parents,
-                    child_maps,
-                    visibility_cpu,
-                    retrieve_next_token_cpu,
-                    retrieve_next_sibling_cpu
-                ) = build_ddtree_tree(
-                    # topk=topk,
-                    logits[req_i],
-                    self.num_draft_tokens - 1
-                )
-                # draft token id
-                draft_tokens[req_i, 0].copy_(block_ids[req_i])
-                draft_tokens[req_i, 1:].copy_(node_token_ids)
-                # positons
-                start = start_positions[req_i]
-                verify_position_ids[req_i, 0] = 0
-                verify_position_ids[req_i, 1:n_token].copy_(node_depths, non_blocking=False)
-                verify_position_ids[req_i, :].add_(start)
-                # masks
-                mask = torch.ones((n_token, n_token + start), dtype=torch.bool, device=draft_tokens.device)
-                mask[:, start:].copy_(visibility_cpu)
-                mask_chunks.append(mask.flatten())
-                retrieve_next_token[req_i].copy_(retrieve_next_token_cpu)
-                retrieve_next_sibling[req_i].copy_(retrieve_next_sibling_cpu)
-            input_mask = torch.cat(mask_chunks, dim=0)
-            verify_input = DFlashVerifyInput(
-                draft_token=draft_tokens.reshape(-1),
-                positions=verify_position_ids.reshape(-1),
-                draft_token_num=n_token,
-                custom_mask=input_mask,
-                retrieve_index=retrieve_index,
-                retrieve_next_token=retrieve_next_token,
-                retrieve_next_sibling=retrieve_next_sibling,
-            )
-            return verify_input
-
+            # logits = logits.float()
+            top_logits, top_token_ids = torch.topk(logits, k=topk, dim=-1)
+            log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
+            top_log_probs = top_logits - log_z
         else:
-            raise NotImplementedError("Currently DDTree only support tp_size == 1")        
+            raise NotImplementedError("Currently DDTree only support tp_size == 1")
+
+        # TODO(DB-guo): build tree batch and write cuda kernel
+        draft_tokens = self._draft_block_tokens_buf[:batch_size]
+        verify_position_ids = self._draft_block_positions_buf[:batch_size]
+        n_token = self.num_draft_tokens
+        mask_chunks: list[torch.Tensor] = []
+        retrieve_buf = torch.full(
+            (2, batch_size, n_token), -1, device=draft_tokens.device, dtype=torch.long
+        )
+        retrieve_next_token, retrieve_next_sibling = retrieve_buf
+        retrieve_index = torch.arange(0, batch_size * n_token, device=draft_tokens.device).reshape(batch_size, n_token)
+        for req_i in range(batch_size):
+            (
+                node_token_ids,
+                node_depths,
+                parents,
+                child_maps,
+                visibility_cpu,
+                retrieve_next_token_cpu,
+                retrieve_next_sibling_cpu
+            ) = build_ddtree_tree_one_req(
+                top_token_ids[req_i],
+                top_log_probs[req_i],
+                self.num_draft_tokens - 1
+            )
+            # draft token id
+            draft_tokens[req_i, 0].copy_(block_ids[req_i])
+            draft_tokens[req_i, 1:].copy_(node_token_ids)
+            # positons
+            start = start_positions[req_i]
+            verify_position_ids[req_i, 0] = 0
+            verify_position_ids[req_i, 1:n_token].copy_(node_depths, non_blocking=False)
+            verify_position_ids[req_i, :].add_(start)
+            # masks
+            mask = torch.ones((n_token, n_token + start), dtype=torch.bool, device=draft_tokens.device)
+            mask[:, start:].copy_(visibility_cpu)
+            mask_chunks.append(mask.flatten())
+            retrieve_next_token[req_i].copy_(retrieve_next_token_cpu)
+            retrieve_next_sibling[req_i].copy_(retrieve_next_sibling_cpu)
+        input_mask = torch.cat(mask_chunks, dim=0)
+        verify_input = DFlashVerifyInput(
+            draft_token=draft_tokens.reshape(-1),
+            positions=verify_position_ids.reshape(-1),
+            draft_token_num=n_token,
+            custom_mask=input_mask,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+        )
+        return verify_input
+
 
 
     def _append_target_hidden_to_draft_kv(

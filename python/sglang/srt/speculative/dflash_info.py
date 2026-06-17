@@ -38,6 +38,10 @@ from sglang.srt.server_args import get_global_server_args
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.utils import next_power_of_2
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.layers.dp_attention import (
+    get_attention_tp_group,
+    is_dp_attention_enabled,
+)
 
 import logging
 logger = logging.getLogger(__name__)
@@ -386,7 +390,7 @@ class DFlashVerifyInput(SpecInput):
             and not sampling_info.is_all_greedy
             and is_dflash_sampling_verify_available()
         ):
-            # TODO: just reuse this part in dflash_utils
+            # TODO(DB-guo): just reuse this part in dflash_utils
             # ref: compute_dflash_sampling_correct_drafts_and_bonus
             assert candidates.ndim == 2
             next_token_logits = logits_output.next_token_logits
@@ -479,7 +483,11 @@ class DFlashVerifyInput(SpecInput):
                 threshold_acc=threshold_acc,
                 deterministic=True,
             )
-            tp_group = get_tp_group()
+            tp_group = (
+                get_attention_tp_group()
+                if is_dp_attention_enabled()
+                else get_tp_group()
+            )
             if tp_group.world_size > 1:
                 tp_group.broadcast(predicts, src=0)
                 tp_group.broadcast(accept_index, src=0)

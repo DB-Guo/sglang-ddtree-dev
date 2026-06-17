@@ -910,7 +910,6 @@ class DFlashWorker:
         chunk_size: int = 256,
     ):
         start_positions = batch.seq_lens_cpu
-        block_ids = draft_input.bonus_tokens
         batch_size = draft_hidden.shape[0]
         hidden_states = draft_hidden[:, 1:, :]
         if hidden_states.numel() == 0:
@@ -927,23 +926,36 @@ class DFlashWorker:
         shard = lm_head.shard_indices
         weight = lm_head.weight  # [local_vocab_padded, hidden]
         num_org = int(shard.num_org_elements)
-        weight_dtype = weight.dtype
+        org_vocab_start = int(shard.org_vocab_start_index)
 
         num_added = int(shard.num_added_elements)
         if num_added != 0:
             raise NotImplementedError("Currently DDTree does not support added vocab")
-    
         # 1. Compute topk logits and logsumexp of each position
+        local_logits = torch.matmul(hidden_states, weight[:num_org].T)
+        # local_logits = local_logits.float()
+        token_budget = self.num_draft_tokens - 1
+        assert token_budget <= num_org # less likely
+        topk = min(token_budget, local_logits.shape[-1])
+        local_topk = topk
+        global_topk = topk
+        local_top_logits, idx = torch.topk(local_logits, k=local_topk, dim=-1) # (bs, num_draft_tokens - 1, topk)
+        local_log_z = torch.logsumexp(local_logits, dim=-1, keepdim=True) # (bs, num_draft_tokens - 1, 1)
         if tp_size == 1:
-            logits = torch.matmul(hidden_states, weight[:num_org].T)
-            token_budget = self.num_draft_tokens - 1
-            topk = min(token_budget, logits.shape[-1])
-            # logits = logits.float()
-            top_logits, top_token_ids = torch.topk(logits, k=topk, dim=-1)
-            log_z = torch.logsumexp(logits, dim=-1, keepdim=True)
-            top_log_probs = top_logits - log_z
+            top_logits = local_top_logits
+            local_top_token_ids = idx
+            global_top_token_ids = local_top_token_ids
+            global_log_z = local_log_z
+            global_top_log_probs = top_logits - global_log_z
         else:
-            raise NotImplementedError("Currently DDTree only support tp_size == 1")
+            local_top_token_ids = idx + org_vocab_start
+            log_z_vec = tp_group.all_gather(local_log_z, dim=-1) # (bs, num_draft_tokens - 1, tp_size)
+            global_log_z = torch.logsumexp(log_z_vec, dim=-1, keepdim=True)
+            top_token_ids_vec = tp_group.all_gather(local_top_token_ids, dim=-1) # (bs, num_draft_tokens - 1, tp_size * topk)
+            top_logits_vec = tp_group.all_gather(local_top_logits, dim=-1) # (bs, num_draft_tokens - 1, tp_size * topk)
+            top_logits, idx = torch.topk(top_logits_vec, global_topk, dim=-1)
+            global_top_token_ids = top_token_ids_vec.gather(-1, idx) # (bs, num_draft_tokens - 1, topk)
+            global_top_log_probs = top_logits - global_log_z
 
         # TODO(DB-guo): build tree batch and write cuda kernel
         draft_tokens = self._draft_block_tokens_buf[:batch_size]
@@ -965,12 +977,12 @@ class DFlashWorker:
                 retrieve_next_token_cpu,
                 retrieve_next_sibling_cpu
             ) = build_ddtree_tree_one_req(
-                top_token_ids[req_i],
-                top_log_probs[req_i],
+                global_top_token_ids[req_i],
+                global_top_log_probs[req_i],
                 self.num_draft_tokens - 1
             )
             # draft token id
-            draft_tokens[req_i, 0].copy_(block_ids[req_i])
+            draft_tokens[req_i, 0].copy_(draft_input.bonus_tokens[req_i])
             draft_tokens[req_i, 1:].copy_(node_token_ids)
             # positons
             start = start_positions[req_i]

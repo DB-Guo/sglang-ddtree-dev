@@ -37,7 +37,7 @@ from sglang.srt.server_args import get_global_server_args
 
 from sglang.srt.speculative.eagle_utils import verify_tree_greedy_func
 from sglang.srt.utils import next_power_of_2
-
+from sglang.srt.distributed import get_tp_group
 
 import logging
 logger = logging.getLogger(__name__)
@@ -479,7 +479,11 @@ class DFlashVerifyInput(SpecInput):
                 threshold_acc=threshold_acc,
                 deterministic=True,
             )
-            # TODO TP broadcast predict accept_index num_correct_drafts??
+            tp_group = get_tp_group()
+            if tp_group.world_size > 1:
+                tp_group.broadcast(predicts, src=0)
+                tp_group.broadcast(accept_index, src=0)
+                tp_group.broadcast(accept_token_num, src=0)
 
         else:
             target_predict = torch.argmax(logits_output.next_token_logits, dim=-1).view(
